@@ -25,6 +25,7 @@ IMG_ARCH_LIST = {
     "krea2",       # Krea-2 (some builds; files may also use qwen_image)
     "sensenova_u15",  # SenseNova U1.5 MoT (Comfy image_model id; keep original keys)
     "minimax_music3",  # MiniMax Music 3 DiT (same tag on the TE, see below)
+    "moss_image",  # MOSS-Image DiT (core comfy.ldm.moss_image; keys are original comfy names)
     "diffusion_model",  # generic fallback used by agnostic convert scripts
 }
 TXT_ARCH_LIST = {
@@ -476,6 +477,154 @@ def llama_permute(raw_sd, n_head, n_head_kv):
             v.data = permute(v.data, n_head_kv)
         sd[k] = v
     return sd
+
+def _untile_v(tensor, num_k_heads, num_v_per_k, head_dim, dim):
+    """Inverse of the converter's _reorder_v_heads: tiled -> grouped V order.
+
+    The llama.cpp qwen3.5 converter reorders V heads from the HF grouped-by-K
+    layout ([G0_v0..vr, G1_v0..vr, ...]) to the ggml tiled layout
+    ([G0_v0, G1_v0, ..., G0_v1, ...]). The tiled data is v-major, so reshape
+    to (..., v_per_k, k, d) and swap those two axes to recover grouped order.
+    """
+    shape = list(tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    t = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return t.permute(*perm).contiguous().reshape(*shape)
+
+def qwen35_hybrid_corrections(sd, metadata):
+    """Reverse the llama.cpp qwen35 converter transforms so comfy's
+    comfy.text_encoders.qwen35 (HF-layout GatedDeltaNet / GatedAttention) loads.
+
+    Per layer type:
+      linear_attention (llama.cpp ssm_*/attn_qkv/attn_gate):
+        attn_qkv        -> linear_attn.in_proj_qkv.weight  (V rows untiled)
+        attn_gate       -> linear_attn.in_proj_z.weight    (rows untiled)
+        ssm_beta        -> linear_attn.in_proj_b.weight    (rows untiled)
+        ssm_alpha       -> linear_attn.in_proj_a.weight    (rows untiled)
+        ssm_out         -> linear_attn.out_proj.weight     (columns untiled)
+        ssm_conv1d      -> linear_attn.conv1d.weight       ((dim,4) -> (dim,1,4), V channels untiled)
+        ssm_dt.bias     -> linear_attn.dt_bias             (untiled)
+        ssm_a           -> linear_attn.A_log               (A_log = -log(-ssm_a), untiled)
+        ssm_norm.weight -> linear_attn.norm.weight         (no +1: converter skips it)
+      full_attention:
+        attn_q/attn_k/attn_v/attn_output -> self_attn.{q,k,v,o}_proj (q carries the gate half; neox-style rope, no permute)
+        attn_q_norm./attn_k_norm.        -> self_attn.{q,k}_norm.    (-1)
+    Common:
+      attn_norm -> input_layernorm (-1); post_attention_norm -> post_attention_layernorm (-1)
+      token_embd -> model.embed_tokens; output_norm -> model.norm (-1); output.weight -> lm_head.weight
+    """
+    n_k = int(metadata.get("qwen35.ssm.group_count") or 0)
+    n_v = int(metadata.get("qwen35.ssm.time_step_rank") or 0)
+    head_k_dim = int(metadata.get("qwen35.ssm.state_size") or 0)
+    untile = n_k > 0 and n_v > 0 and n_k != n_v and head_k_dim > 0
+    n_v_per_k = n_v // n_k if untile else 0
+
+    def untile_rows(v, head_dim):
+        if not untile:
+            return v
+        return _untile_v(v, n_k, n_v_per_k, head_dim, 0)
+
+    def dequant(v):
+        return dequantize_tensor(v, dtype=torch.float32) if is_quantized(v) else v.float()
+
+    def shift_norm(v, delta):
+        # Converter stored w_llama = 1 + w_hf for every RMSNorm except
+        # linear_attn.norm; reverse exactly like gemma3_norm_corrections.
+        return dequant(v) + delta
+
+    LINEAR_MAP = {
+        "attn_qkv.weight":  "linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight": "linear_attn.in_proj_z.weight",
+        "ssm_beta.weight":  "linear_attn.in_proj_b.weight",
+        "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+        "ssm_out.weight":   "linear_attn.out_proj.weight",
+        "ssm_norm.weight":  "linear_attn.norm.weight",
+    }
+    FULL_MAP = {
+        "attn_q.weight":      "self_attn.q_proj.weight",
+        "attn_k.weight":      "self_attn.k_proj.weight",
+        "attn_v.weight":      "self_attn.v_proj.weight",
+        "attn_output.weight": "self_attn.o_proj.weight",
+        "attn_q_norm.weight": "self_attn.q_norm.weight",
+        "attn_k_norm.weight": "self_attn.k_norm.weight",
+    }
+    out = {}
+    qkv_rows = head_k_dim * n_k * 2  # q|k rows of in_proj_qkv; the rest is V
+    # Keys use the HF VL naming ("model.language_model.layers.N...") that
+    # comfy's detect_te_model probes for QWEN35; load_text_encoder_state_dicts
+    # strips the prefix itself once detected.
+    layer_prefix = "model.language_model.layers.{}."
+    for k, v in sd.items():
+        m = re.match(r"^blk\.(\d+)\.(.+)$", k)
+        if m is None:
+            # token_embd / output_norm / output / rope etc.
+            if k == "token_embd.weight":
+                out["model.language_model.embed_tokens.weight"] = v
+            elif k == "output_norm.weight":
+                out["model.language_model.norm.weight"] = shift_norm(v, -1.0)
+            elif k == "output.weight":
+                # Core's generate() path casts lm_head as a plain weight; a
+                # packed K-quant GGMLTensor crashes inside cast_bias_weight.
+                out["lm_head.weight"] = dequantize_tensor(v, dtype=torch.float16)
+            else:
+                out[k] = v
+            continue
+        idx, name = m.group(1), m.group(2)
+        dst = layer_prefix.format(idx)
+        if name == "attn_norm.weight":
+            out[dst + "input_layernorm.weight"] = shift_norm(v, -1.0)
+        elif name == "post_attention_norm.weight":
+            out[dst + "post_attention_layernorm.weight"] = shift_norm(v, -1.0)
+        elif name == "ffn_gate.weight":
+            out[dst + "mlp.gate_proj.weight"] = v
+        elif name == "ffn_up.weight":
+            out[dst + "mlp.up_proj.weight"] = v
+        elif name == "ffn_down.weight":
+            out[dst + "mlp.down_proj.weight"] = v
+        elif name == "ssm_conv1d.weight":
+            # After the loader's dim reversal this is the converter's squeezed
+            # HF (dim, 1, 4) view: (dim, 4). Untile only the V channels, then
+            # rebuild the kernel axis.
+            t = dequant(v)
+            if untile:
+                qk = t[:qkv_rows]
+                vt = _untile_v(t[qkv_rows:], n_k, n_v_per_k, head_k_dim, 0)
+                t = torch.cat([qk, vt], dim=0)
+            out[dst + "linear_attn.conv1d.weight"] = t.unsqueeze(1)  # (dim, 1, 4)
+        elif name == "ssm_dt.bias":
+            out[dst + "linear_attn.dt_bias"] = untile_rows(dequant(v), 1)
+        elif name == "ssm_a":
+            # Converter wrote -exp(A_log); recover A_log.
+            out[dst + "linear_attn.A_log"] = untile_rows(-torch.log(-dequant(v)), 1)
+        elif name in LINEAR_MAP:
+            new_k = dst + LINEAR_MAP[name]
+            t = dequant(v)
+            if name == "attn_qkv.weight":
+                qk = t[:qkv_rows]
+                vt = untile_rows(t[qkv_rows:], head_k_dim)
+                out[new_k] = torch.cat([qk, vt], dim=0)
+            elif name == "attn_gate.weight":
+                out[new_k] = untile_rows(t, head_k_dim)
+            elif name == "ssm_out.weight":
+                out[new_k] = _untile_v(t, n_k, n_v_per_k, head_k_dim, 1) if untile else t
+            elif name == "ssm_norm.weight":
+                out[new_k] = t
+            else:
+                out[new_k] = untile_rows(t, 1)
+        elif name in FULL_MAP:
+            new_k = dst + FULL_MAP[name]
+            if name.endswith("q_norm.weight") or name.endswith("k_norm.weight"):
+                out[new_k] = shift_norm(v, -1.0)
+            else:
+                out[new_k] = v
+        else:
+            logging.warning(f"qwen35 GGUF: unmapped block tensor {k!r}, passing through")
+            out[dst + name] = v
+    return out
 
 def gemma3_norm_corrections(sd):
     # Reverse change from Gemma3Model modify_tensors in llama.cpp convert script
@@ -940,6 +1089,12 @@ def gguf_clip_loader(path):
             sd = gemma3_norm_corrections(sd)
             if arch != "gemma3":
                 sd = _merge_gemma4_fixups(path, sd)
+        elif arch == "qwen35":
+            # Qwen3.5 hybrid (Qwen3-Next style): llama.cpp names AND transforms
+            # are nothing LLAMA_SD_MAP handles (ssm_*/attn_qkv/attn_gate with
+            # converter-side A_log/conv/V-order/norm+1 changes), so the whole
+            # mapping is done in one pass over the raw names.
+            sd = qwen35_hybrid_corrections(sd, extra.get("metadata", {}))
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         sd = _add_hf_model_prefix(sd, arch)
